@@ -12,4 +12,7 @@ services:
       # Demo knob: simulate slow inference (ms). Submit/query/cancel stay
       # responsive regardless. Set e.g. "2000" to see the effect.
       INFERENCE_DELAY_MS: "0"
+      # Confidence-calibration temperature before the first successful
+      # POST /calibration (must stay within [0.25, 4.0]).
+      INITIAL_TEMPERATURE: "1.0"
     restart: unless-stopped

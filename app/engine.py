@@ -27,14 +27,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
+
+from . import calibration as calib
 
 log = logging.getLogger("batch-engine")
 
@@ -44,6 +47,30 @@ COMPLETED = "completed"
 CANCELLED = "cancelled"
 EXPIRED = "expired"
 FAILED = "failed"
+
+
+class CalibrationError(Exception):
+    """Base class for calibration request failures."""
+
+
+class CalibrationValidationError(CalibrationError):
+    """Request content is invalid (bad count, duplicates, labels ...)."""
+
+
+class CalibrationOrderError(CalibrationError):
+    """A referenced order is known but not usable for calibration."""
+
+
+class CalibrationUnknownOrder(CalibrationError):
+    """A referenced order_id does not exist (maps to 404)."""
+
+
+class CalibrationInProgress(CalibrationError):
+    """Another calibration request is currently being fitted."""
+
+
+class CalibrationFitError(CalibrationError):
+    """The numerical fit failed; the current temperature is retained."""
 
 
 # eq=False: orders are compared by identity. The default dataclass __eq__
@@ -58,6 +85,14 @@ class Order:
     result: Optional[dict] = None
     batch_id: Optional[str] = None
     created_at: float = field(default_factory=time.monotonic)
+    # Temperature captured at acceptance. Queued/processing orders keep using
+    # it even if a calibration changes the global temperature mid-flight.
+    temperature: float = 1.0
+    # Filled on completion: the original model output and its softmax(T=1).
+    # Calibration always reads these *uncalibrated* scores, even when the same
+    # order is submitted as a calibration sample more than once.
+    logits: Optional[list[float]] = None
+    raw_scores: Optional[list[float]] = None
 
 
 class BatchEngine:
@@ -68,11 +103,22 @@ class BatchEngine:
         batch_size: int = 4,
         batch_wait_ms: int = 50,
         inference_delay_ms: int = 0,
+        initial_temperature: float = 1.0,
     ) -> None:
         self.max_capacity = max_capacity
         self.batch_size = batch_size
         self.batch_wait_s = batch_wait_ms / 1000.0
         self.inference_delay_s = inference_delay_ms / 1000.0
+
+        # Global confidence-calibration temperature. Only updated on the event
+        # loop thread by `calibrate`; read when an order is accepted.
+        t0 = float(initial_temperature)
+        if not (calib.TEMP_MIN <= t0 <= calib.TEMP_MAX):
+            raise ValueError(
+                f"initial_temperature must be within [{calib.TEMP_MIN}, {calib.TEMP_MAX}]"
+            )
+        self.temperature = t0
+        self._calibration_in_progress = False
 
         # Single-threaded CPU inference keeps results deterministic and makes
         # the "one batch at a time" guarantee easy to reason about.
@@ -85,6 +131,11 @@ class BatchEngine:
         self._inflight = 0  # orders inside the batch currently being computed
         self._not_empty = asyncio.Event()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
+        # Separate single-thread executor: temperature fitting must never block
+        # (or queue behind) model inference, and vice versa.
+        self._calib_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="calibrate"
+        )
         self._worker: Optional[asyncio.Task] = None
         # Counters for /stats and tests.
         self.batches_started = 0
@@ -104,6 +155,7 @@ class BatchEngine:
             except asyncio.CancelledError:
                 pass
         self._executor.shutdown(wait=False)
+        self._calib_executor.shutdown(wait=False)
 
     # ------------------------------------------------------------------ #
     # helpers (event-loop thread only)
@@ -148,6 +200,8 @@ class BatchEngine:
             "inflight": self._inflight,
             "batches_started": self.batches_started,
             "last_batch_size": self.last_batch_size,
+            "temperature": self.temperature,
+            "calibration_in_progress": self._calibration_in_progress,
             "orders": counts,
         }
 
@@ -163,6 +217,9 @@ class BatchEngine:
             tensor=tensor,
             deadline_ms=deadline_ms,
             deadline_at=time.monotonic() + deadline_ms / 1000.0,
+            # Snapshot the current temperature: later recalibration must not
+            # change the score this order will be scored with.
+            temperature=self.temperature,
         )
         self._orders[order.id] = order
         self._pending.append(order)
@@ -191,6 +248,98 @@ class BatchEngine:
             # compute actually ends; no new batch is started because of it.
             o.state = CANCELLED
         return o
+
+    # ------------------------------------------------------------------ #
+    # confidence calibration (all checks run on the event-loop thread)
+    # ------------------------------------------------------------------ #
+    def _build_calibration_data(
+        self, samples: Sequence[tuple[str, int]]
+    ) -> tuple[list[list[float]], list[int]]:
+        if not (calib.MIN_SAMPLES <= len(samples) <= calib.MAX_SAMPLES):
+            raise CalibrationValidationError(
+                f"expected between {calib.MIN_SAMPLES} and {calib.MAX_SAMPLES} "
+                f"samples, got {len(samples)}"
+            )
+        ids = [s[0] for s in samples]
+        if len(set(ids)) != len(ids):
+            raise CalibrationValidationError("order_id values must be distinct")
+        raw_scores: list[list[float]] = []
+        labels: list[int] = []
+        for order_id, label in samples:
+            if not isinstance(label, int) or not (0 <= label <= 9):
+                raise CalibrationValidationError(
+                    f"label for {order_id} must be an integer in [0, 9]"
+                )
+            o = self._orders.get(order_id)
+            if o is None:
+                raise CalibrationUnknownOrder(f"unknown order_id: {order_id}")
+            if o.state != COMPLETED or o.raw_scores is None:
+                raise CalibrationOrderError(
+                    f"order {order_id} is not completed (state={o.state}); "
+                    "only completed orders can calibrate"
+                )
+            # Always the uncalibrated original-model scores, even if this
+            # order already served as a calibration sample before.
+            raw_scores.append(o.raw_scores)
+            labels.append(label)
+        return raw_scores, labels
+
+    async def calibrate(
+        self, samples: Sequence[tuple[str, int]]
+    ) -> dict:
+        """Fit a candidate temperature and keep it only when NLL improves.
+
+        Overlapping calls fail with ``CalibrationInProgress``; fit failures
+        leave the current temperature untouched.
+        """
+        if self._calibration_in_progress:
+            raise CalibrationInProgress("a calibration request is already running")
+        self._calibration_in_progress = True
+        try:
+            # Content validation while the overlap flag is held, so a second
+            # request racing an invalid one still observes 409.
+            raw_scores, labels = self._build_calibration_data(samples)
+            current_temp = self.temperature
+            loop = asyncio.get_running_loop()
+
+            def _fit() -> tuple[float, float, float, float]:
+                # Runs on the dedicated calibration thread. Both losses use
+                # the same uncalibrated scores and the same sample set.
+                cur_loss = calib.mean_nll(current_temp, raw_scores, labels)
+                cand_temp, cand_loss = calib.fit_temperature(raw_scores, labels)
+                return cur_loss, cand_temp, cand_loss
+
+            try:
+                current_loss, candidate_temp, candidate_loss = await loop.run_in_executor(
+                    self._calib_executor, _fit
+                )
+            except Exception as exc:  # noqa: BLE001 - fit failure keeps old T
+                raise CalibrationFitError(f"temperature fitting failed: {exc}") from exc
+
+            if not (
+                math.isfinite(candidate_temp)
+                and math.isfinite(candidate_loss)
+                and calib.TEMP_MIN <= candidate_temp <= calib.TEMP_MAX
+            ):
+                raise CalibrationFitError("fitted temperature/loss is invalid")
+
+            applied = current_loss - candidate_loss > calib.IMPROVEMENT_EPS
+            if applied:
+                # Only affects orders accepted from this point on; existing
+                # orders carry their own captured temperature.
+                self.temperature = candidate_temp
+            effective_temp = candidate_temp if applied else current_temp
+            return {
+                "current_temperature": current_temp,
+                "current_loss": current_loss,
+                "candidate_temperature": candidate_temp,
+                "candidate_loss": candidate_loss,
+                "applied": applied,
+                "temperature": effective_temp,
+                "sample_count": len(samples),
+            }
+        finally:
+            self._calibration_in_progress = False
 
     # ------------------------------------------------------------------ #
     # batching worker
@@ -235,7 +384,9 @@ class BatchEngine:
             tensors = torch.stack([o.tensor for o in batch])
 
             try:
-                scores = await loop.run_in_executor(self._executor, self._infer, tensors)
+                logits_rows = await loop.run_in_executor(
+                    self._executor, self._infer, tensors
+                )
             except Exception:  # noqa: BLE001 - defensive: model failure must not kill the worker
                 log.exception("inference failed for batch %s", batch_id)
                 for o in batch:
@@ -245,7 +396,7 @@ class BatchEngine:
                 continue
 
             now = time.monotonic()
-            for o, sc in zip(batch, scores):
+            for o, row in zip(batch, logits_rows):
                 if o.state != PROCESSING:
                     # Cancelled or expired mid-flight: result is discarded and
                     # the late result must NOT revive the order.
@@ -254,8 +405,17 @@ class BatchEngine:
                     o.state = EXPIRED
                     continue
                 o.state = COMPLETED
-                predicted = max(range(len(sc)), key=lambda i: sc[i])
-                o.result = {"predicted_class": predicted, "scores": sc}
+                o.logits = list(row)
+                # Uncalibrated original-model scores (T = 1). Kept verbatim so
+                # later calibration always fits against the raw model output.
+                o.raw_scores = calib.softmax(row, 1.0)
+                # The receipt is scaled with the temperature captured at
+                # acceptance; later recalibrations never rewrite it.
+                scores = calib.softmax(row, o.temperature)
+                o.result = {
+                    "predicted_class": max(range(len(row)), key=lambda i: row[i]),
+                    "scores": scores,
+                }
             self._inflight = 0
 
     # ------------------------------------------------------------------ #
@@ -265,6 +425,7 @@ class BatchEngine:
         if self.inference_delay_s > 0:
             time.sleep(self.inference_delay_s)  # demo: simulate a slow model
         with torch.inference_mode():
+            # Return raw logits: the event-loop thread derives both the
+            # uncalibrated (T=1) and temperature-scaled probabilities.
             logits = self.model(batch_tensor)
-            probs = torch.softmax(logits, dim=1)
-        return [[float(v) for v in row] for row in probs]
+        return [[float(v) for v in row] for row in logits]

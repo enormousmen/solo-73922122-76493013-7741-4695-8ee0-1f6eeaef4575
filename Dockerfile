@@ -14,14 +14,16 @@ COPY app ./app
 COPY samples ./samples
 
 # Runtime configuration (all optional, defaults shown):
-#   MAX_CAPACITY=16        max images queued or in-flight
-#   BATCH_SIZE=4           max images per batch
-#   BATCH_WAIT_MS=50       idle model waits at most this long to fill a batch
-#   INFERENCE_DELAY_MS=0   artificial delay to demo slow inference
+#   MAX_CAPACITY=16          max images queued or in-flight
+#   BATCH_SIZE=4             max images per batch
+#   BATCH_WAIT_MS=50         idle model waits at most this long to fill a batch
+#   INFERENCE_DELAY_MS=0     artificial delay to demo slow inference
+#   INITIAL_TEMPERATURE=1.0  calibration temperature before the first fit
 ENV MAX_CAPACITY=16 \
     BATCH_SIZE=4 \
     BATCH_WAIT_MS=50 \
-    INFERENCE_DELAY_MS=0
+    INFERENCE_DELAY_MS=0 \
+    INITIAL_TEMPERATURE=1.0
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

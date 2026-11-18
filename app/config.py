@@ -16,6 +16,9 @@ class Settings:
     batch_wait_ms: int = 50       # idle model waits at most this long to fill a batch
     # Demo knob: artificial delay inside the inference worker to simulate a slow model.
     inference_delay_ms: int = 0
+    # Confidence-calibration temperature used before the first successful
+    # calibration (softmax with T=1 reproduces the raw model probabilities).
+    initial_temperature: float = 1.0
     model_path: str = _DEFAULT_MODEL_PATH
 
     @classmethod
@@ -25,5 +28,6 @@ class Settings:
             batch_size=int(os.getenv("BATCH_SIZE", "4")),
             batch_wait_ms=int(os.getenv("BATCH_WAIT_MS", "50")),
             inference_delay_ms=int(os.getenv("INFERENCE_DELAY_MS", "0")),
+            initial_temperature=float(os.getenv("INITIAL_TEMPERATURE", "1.0")),
             model_path=os.getenv("MODEL_PATH", _DEFAULT_MODEL_PATH),
         )
